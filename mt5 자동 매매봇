@@ -1,0 +1,730 @@
+//+------------------------------------------------------------------+
+//| Hybrid_Shot_Pro_ICT_Wrapper_PRO_v50_strict_while.mq5            |
+//| MT5 Expert Advisor - Copy* APIs only (strict, while-safe loops)  |
+//| Features: License lock, sessions, news pause (CSV), ICT filters, |
+//| risk mgmt, BE, trailing, partial close, CSV stats, status panel  |
+//+------------------------------------------------------------------+
+#property strict
+#property version   "5.0"
+#property description "Hybrid Shot Pro ICT Wrapper (MT5, strict & while-safe)"
+
+#include <Trade/Trade.mqh>
+CTrade Trade;
+
+//------------------------------ Inputs ------------------------------//
+input string   LicensedAccount      = "00000000";
+input datetime ExpiryDate           = D'2099.12.31';
+
+input bool     EnableEA             = true;
+input int      MagicNumber          = 920001;
+
+enum Dir { DIR_Both=0, DIR_BuyOnly=1, DIR_SellOnly=2 };
+input Dir      TradeDirection       = DIR_Both;
+
+input bool     UseFixedLot          = true;
+input double   FixedLotSize         = 0.10;
+input double   MaxRiskPercent       = 1.0;
+
+input int      MaxSpreadPoints      = 120;
+input int      SlippagePoints       = 20;
+input int      MaxPositionsPerSym   = 1;
+input int      MaxPositionsTotal    = 3;
+
+input bool     UseSessionFilter     = true;
+input int      SessionStartHour     = 2;    // server hour (inclusive)
+input int      SessionEndHour       = 16;   // server hour (exclusive)
+
+input bool     UseICTSessions       = true;
+input int      LondonStartHour      = 10;
+input int      LondonEndHour        = 14;
+input int      NewYorkStartHour     = 15;
+input int      NewYorkEndHour       = 20;
+
+input bool     UseNewsPause         = true;
+input string   NewsFile             = "news.csv";   // MQL5/Files/news.csv
+input int      NewsPauseBeforeMin   = 30;
+input int      NewsPauseAfterMin    = 30;
+
+input bool     UseATRStops          = true;
+input int      ATRPeriod            = 14;
+input double   ATR_SL_Mult          = 1.5;
+input double   ATR_TP_Mult          = 2.0;
+input double   MinSL_Pips           = 3.0;
+
+input bool     EnableBreakEven      = true;
+input double   BreakEvenTriggerPips = 4.0;
+input double   BreakEvenOffsetPips  = 1.0;
+
+enum TrailingMode { TRAIL_None=0, TRAIL_Fixed=1, TRAIL_ATR=2 };
+input TrailingMode DefaultTrailing  = TRAIL_ATR;
+input double   TrailingStartPips    = 3.0;
+input double   TrailingDistancePips = 2.0;
+input double   ATR_Trail_Mult       = 1.0;
+
+input bool     EnablePartialClose   = true;
+input double   PC1_TriggerPips      = 8.0;
+input double   PC1_ClosePct         = 50.0;
+
+input double   PC2_TriggerPips      = 15.0;
+input double   PC2_ClosePct         = 25.0;
+
+input double   PC3_TriggerPips      = 25.0;
+input double   PC3_ClosePct         = 25.0;
+enum EntryMode { ENTRY_Simple=0, ENTRY_ICT=1 };
+input EntryMode SignalMode          = ENTRY_ICT;
+
+input int      RSIPeriod            = 14;
+input double   RSI_BuyLevel         = 30.0;
+input double   RSI_SellLevel        = 70.0;
+input int      FastMAPeriod         = 9;
+input int      SlowMAPeriod         = 50;
+
+input int      ICT_SwingLen         = 5;
+input ENUM_TIMEFRAMES ICT_TF        = PERIOD_M15;
+input bool     ICT_RequireBOS       = true;
+input bool     ICT_RequireSweep     = true;
+input bool     ICT_UseOTE           = true;
+input bool     ICT_UseSessionRange  = true;
+input bool     ICT_UseFVG           = false;
+
+input bool     EnableCSVLogging     = true;
+input string   CSVLogFile           = "ea_log.csv";
+input bool     EnableStats          = true;
+input string   CSVStatsFile         = "ea_stats.csv";
+
+input double   MaxDailyLossPercent  = 0.0;   // 0 = disabled
+
+//------------------------------ Globals -----------------------------//
+string   GSymbol="";
+int      GDigits=5;
+double   GPoint=0.0;
+double   GPip=0.0001;
+
+datetime GDayStart=0;
+double   GEquityAtDayStart=0.0;
+
+ulong    GOrders=0, GWins=0, GLosses=0;
+double   GGrossPnL=0.0, GMaxDD=0.0;
+datetime GLastPanel=0;
+
+//------------------------------ Helpers -----------------------------//
+double PipValue(){ return (StringFind(GSymbol,"JPY")>=0 ? 0.01 : 0.0001); }
+double PriceToPips(double v){ return v / PipValue(); }
+double PipsToPoints(double p){ return (p * PipValue()) / _Point; }
+int    SpreadPoints(){ return (int)SymbolInfoInteger(GSymbol, SYMBOL_SPREAD); }
+
+void LogCSV(const string msg)
+{
+   if(!EnableCSVLogging) return;
+   int h=FileOpen(CSVLogFile, FILE_READ|FILE_WRITE|FILE_CSV|FILE_SHARE_READ|FILE_SHARE_WRITE, ',');
+   if(h==INVALID_HANDLE)
+   {
+      h=FileOpen(CSVLogFile, FILE_WRITE|FILE_CSV, ',');
+      if(h==INVALID_HANDLE) return;
+      FileWrite(h,"time","symbol","message");
+   }
+   FileSeek(h,0,SEEK_END);
+   FileWrite(h, TimeToString(TimeCurrent(),TIME_DATE|TIME_MINUTES), GSymbol, msg);
+   FileClose(h);
+}
+void Info(const string s){ Print(s); LogCSV(s); }
+
+double AccountDailyPnLPercent()
+{
+   if(GEquityAtDayStart<=0.0) return 0.0;
+   double cur=AccountInfoDouble(ACCOUNT_EQUITY);
+   return ((cur-GEquityAtDayStart)/GEquityAtDayStart)*100.0;
+}
+void UpdateDrawdownStat()
+{
+   if(GEquityAtDayStart<=0.0) return;
+   double cur=AccountInfoDouble(ACCOUNT_EQUITY);
+   double dd=(GEquityAtDayStart-cur)/GEquityAtDayStart*100.0;
+   if(dd>GMaxDD) GMaxDD=dd;
+}
+void StatsWriteHeader(const int h)
+{
+   FileWrite(h,"time","symbol","orders","wins","losses","win_rate","gross_pnl","max_dd_pct","daily_pnl_pct");
+}
+void FlushStats()
+{
+   if(!EnableStats) return;
+   int h=FileOpen(CSVStatsFile, FILE_READ|FILE_WRITE|FILE_CSV|FILE_SHARE_READ|FILE_SHARE_WRITE, ',');
+   if(h==INVALID_HANDLE)
+   {
+      h=FileOpen(CSVStatsFile, FILE_WRITE|FILE_CSV, ',');
+      if(h==INVALID_HANDLE) return;
+      StatsWriteHeader(h);
+   }
+   FileSeek(h,0,SEEK_END);
+   double wr=(GOrders>0? (double)GWins/(double)GOrders*100.0 : 0.0);
+   FileWrite(h, TimeToString(TimeCurrent(),TIME_DATE|TIME_MINUTES), GSymbol, (long)GOrders, (long)GWins, (long)GLosses, wr, GGrossPnL, GMaxDD, AccountDailyPnLPercent());
+   FileClose(h);
+}
+
+//------------------------------ License -----------------------------//
+bool CheckLicense()
+{
+   long acc=(long)AccountInfoInteger(ACCOUNT_LOGIN);
+   string accStr=IntegerToString((int)acc);
+   if(LicensedAccount!="00000000" && LicensedAccount!=accStr){ Print("License denied"); return false; }
+   if(TimeCurrent()>(datetime)ExpiryDate){ Print("License expired"); return false; }
+   return true;
+}
+
+//------------------------------ Sessions & News ---------------------//
+bool InSession()
+{
+   if(!UseSessionFilter) return true;
+   MqlDateTime dtNow; TimeToStruct(TimeCurrent(), dtNow);
+   int h = (int)dtNow.hour;
+   bool ok;
+   if(SessionStartHour <= SessionEndHour)
+      ok = (h >= SessionStartHour && h < SessionEndHour);
+   else
+      ok = (h >= SessionStartHour || h < SessionEndHour);
+   if(!ok) Info("Session blocked");
+   return ok;
+}
+
+bool InICTSessions()
+{
+   if(!UseICTSessions) return true;
+   MqlDateTime dtNow; TimeToStruct(TimeCurrent(), dtNow);
+   int h = (int)dtNow.hour;
+
+   bool ldn;
+   if(LondonStartHour <= LondonEndHour)
+      ldn = (h >= LondonStartHour && h < LondonEndHour);
+   else
+      ldn = (h >= LondonStartHour || h < LondonEndHour);
+
+   bool ny;
+   if(NewYorkStartHour <= NewYorkEndHour)
+      ny = (h >= NewYorkStartHour && h < NewYorkEndHour);
+   else
+      ny = (h >= NewYorkStartHour || h < NewYorkEndHour);
+
+   bool ok = (ldn || ny);
+   if(!ok) Info("ICT session blocked");
+   return ok;
+}
+
+// CSV: YYYY-MM-DD,HH:MM,COUNTRY,EVENT,IMPACT
+bool InNewsPauseWindow()
+{
+   if(!UseNewsPause) return false;
+   int handle=FileOpen(NewsFile, FILE_READ|FILE_CSV, ',');
+   if(handle==INVALID_HANDLE) return false;
+   datetime now=TimeCurrent();
+   bool paused=false;
+   while(!FileIsEnding(handle))
+   {
+      string sDate=FileReadString(handle); if(FileIsEnding(handle)) break;
+      string sTime=FileReadString(handle);
+      string c=FileReadString(handle);
+      string e=FileReadString(handle);
+      string imp=FileReadString(handle);
+      if(StringLen(sDate)>=10 && StringLen(sTime)>=4)
+      {
+         int y=(int)StringSubstr(sDate,0,4);
+         int m=(int)StringSubstr(sDate,5,2);
+         int d=(int)StringSubstr(sDate,8,2);
+         int hh=(int)StringSubstr(sTime,0,2);
+         int mm=(int)StringSubstr(sTime,3,2);
+         MqlDateTime dt; TimeToStruct(now,dt);
+         dt.year=y; dt.mon=m; dt.day=d; dt.hour=hh; dt.min=mm; dt.sec=0;
+         datetime t=StructToTime(dt);
+         datetime t0=t-NewsPauseBeforeMin*60;
+         datetime t1=t+NewsPauseAfterMin*60;
+         if(now>=t0 && now<=t1){ paused=true; break; }
+      }
+   }
+   FileClose(handle);
+   if(paused) Info("News pause");
+   return paused;
+}
+
+//------------------------------ Market Series -----------------------//
+int LoadSeries(const string sym, ENUM_TIMEFRAMES tf, int need,
+               datetime &T[], double &O[], double &H[], double &L[], double &C[])
+{
+   int nT=CopyTime(sym,tf,0,need,T);
+   int nO=CopyOpen(sym,tf,0,need,O);
+   int nH=CopyHigh(sym,tf,0,need,H);
+   int nL=CopyLow(sym,tf,0,need,L);
+   int nC=CopyClose(sym,tf,0,need,C);
+   if(nT<=0 || nO<=0 || nH<=0 || nL<=0 || nC<=0) return 0;
+   ArraySetAsSeries(T,true);
+   ArraySetAsSeries(O,true);
+   ArraySetAsSeries(H,true);
+   ArraySetAsSeries(L,true);
+   ArraySetAsSeries(C,true);
+   int n=nT;
+   if(nO<n) n=nO;
+   if(nH<n) n=nH;
+   if(nL<n) n=nL;
+   if(nC<n) n=nC;
+   return n;
+}
+
+//------------------------------ Indicators/Signals ------------------//
+bool SimpleSignals(bool &buy, bool &sell)
+{
+   buy=false; sell=false;
+   int hRSI=iRSI(GSymbol,PERIOD_M15,RSIPeriod,PRICE_CLOSE);
+   if(hRSI==INVALID_HANDLE) return false;
+   double rsi[1]; bool okRSI=(CopyBuffer(hRSI,0,0,1,rsi)==1); IndicatorRelease(hRSI);
+
+   int hF=iMA(GSymbol,PERIOD_M15,FastMAPeriod,0,MODE_EMA,PRICE_CLOSE);
+   int hS=iMA(GSymbol,PERIOD_M15,SlowMAPeriod,0,MODE_EMA,PRICE_CLOSE);
+   if(hF==INVALID_HANDLE || hS==INVALID_HANDLE){ if(hF!=INVALID_HANDLE) IndicatorRelease(hF); if(hS!=INVALID_HANDLE) IndicatorRelease(hS); return false; }
+   double f[2], s[2];
+   bool okF=(CopyBuffer(hF,0,0,2,f)==2);
+   bool okS=(CopyBuffer(hS,0,0,2,s)==2);
+   IndicatorRelease(hF); IndicatorRelease(hS);
+   if(!(okRSI && okF && okS)) return false;
+
+   bool crossUp=(f[0]>s[0] && f[1]<=s[1]);
+   bool crossDn=(f[0]<s[0] && f[1]>=s[1]);
+   if(crossUp && rsi[0]<=RSI_BuyLevel)  buy=true;
+   if(crossDn && rsi[0]>=RSI_SellLevel) sell=true;
+   return true;
+}
+
+bool IsSwingHigh(const double &H[], int idx, int len, const int total)
+{
+   if(idx-len<0 || idx+len>=total) return false;
+   for(int k=1;k<=len;k++){ if(H[idx]<=H[idx+k] || H[idx]<=H[idx-k]) return false; }
+   return true;
+}
+bool IsSwingLow(const double &L[], int idx, int len, const int total)
+{
+   if(idx-len<0 || idx+len>=total) return false;
+   for(int k=1;k<=len;k++){ if(L[idx]>=L[idx+k] || L[idx]>=L[idx-k]) return false; }
+   return true;
+}
+
+int DetectBOS(bool &bullBOS, bool &bearBOS)
+{
+   bullBOS=false; bearBOS=false;
+   datetime T[]; double O[],H[],L[],C[];
+   int n=LoadSeries(GSymbol, ICT_TF, 400, T,O,H,L,C);
+   if(n<(2*ICT_SwingLen+10)) return -1;
+   int sh=-1, sl=-1;
+   for(int j=ICT_SwingLen; j<n-ICT_SwingLen; j++)
+   {
+      if(IsSwingHigh(H,j,ICT_SwingLen,n)) sh=j;
+      if(IsSwingLow (L,j,ICT_SwingLen,n)) sl=j;
+   }
+   if(sh==-1 || sl==-1) return -2;
+   if(C[0]>H[sh]) bullBOS=true;
+   if(C[0]<L[sl]) bearBOS=true;
+   return 0;
+}
+
+bool DetectSweep(bool forBuy)
+{
+   datetime T[]; double O[],H[],L[],C[];
+   int n=LoadSeries(GSymbol, ICT_TF, 300, T,O,H,L,C);
+   if(n<(2*ICT_SwingLen+10)) return false;
+   int sw=-1;
+   if(forBuy)
+   {
+      for(int j=ICT_SwingLen;j<n-ICT_SwingLen;j++){ if(IsSwingLow(L,j,ICT_SwingLen,n)) sw=j; }
+      if(sw==-1) return false;
+      if(L[0]<L[sw] && C[0]>=L[sw]) return true;
+   }else
+   {
+      for(int j=ICT_SwingLen;j<n-ICT_SwingLen;j++){ if(IsSwingHigh(H,j,ICT_SwingLen,n)) sw=j; }
+      if(sw==-1) return false;
+      if(H[0]>H[sw] && C[0]<=H[sw]) return true;
+   }
+   return false;
+}
+
+void AsiaRange(double &hi, double &lo)
+{
+   hi = -DBL_MAX; lo = DBL_MAX;
+   datetime T[]; double O[],H[],L[],C[];
+   int n = LoadSeries(GSymbol, ICT_TF, 400, T,O,H,L,C);
+   if(n<=0) return;
+
+   datetime now = TimeCurrent();
+   MqlDateTime md; TimeToStruct(now, md);
+   md.hour=0; md.min=0; md.sec=0;
+   datetime dayStart = StructToTime(md);
+
+   for(int j=0;j<n;j++)
+   {
+      datetime bar_time = T[j];
+      if(bar_time < dayStart) break;
+      MqlDateTime b; TimeToStruct(bar_time, b);
+      int hr = (int)b.hour;
+      if(hr>=2 && hr<9)
+      {
+         if(H[j]>hi) hi=H[j];
+         if(L[j]<lo) lo=L[j];
+      }
+   }
+}
+
+bool ComputeOTE(bool forBuy, double &z1, double &z2)
+{
+   datetime T[]; double O[],H[],L[],C[];
+   int n=LoadSeries(GSymbol, ICT_TF, 400, T,O,H,L,C);
+   if(n<(2*ICT_SwingLen+10)) return false;
+   int sh=-1, sl=-1;
+   for(int j=ICT_SwingLen;j<n-ICT_SwingLen;j++)
+   {
+      if(IsSwingHigh(H,j,ICT_SwingLen,n)) sh=j;
+      if(IsSwingLow (L,j,ICT_SwingLen,n)) sl=j;
+   }
+   if(sh==-1 || sl==-1) return false;
+   double a=0.0,b=0.0,rng=0.0;
+   if(forBuy)
+   {
+      if(sl>sh) return false;
+      a=L[sl]; b=H[sh]; rng=b-a; z1=b-0.79*rng; z2=b-0.62*rng;
+   }else
+   {
+      if(sh>sl) return false;
+      a=H[sh]; b=L[sl]; rng=a-b; z1=b+0.62*rng; z2=b+0.79*rng;
+   }
+   return (z1<z2);
+}
+
+bool HasDirectionalFVG(bool forBuy)
+{
+   datetime T[]; double O[],H[],L[],C[];
+   int n=LoadSeries(GSymbol, ICT_TF, 10, T,O,H,L,C);
+   if(n<5) return false;
+   if(forBuy) return (L[1] > H[2]);
+   return (H[1] < L[2]);
+}
+
+bool ICTSignals(bool &buy, bool &sell)
+{
+   buy=false; sell=false;
+   bool bull=false, bear=false;
+   if(ICT_RequireBOS){ if(DetectBOS(bull,bear)<0) return false; } else { bull=true; bear=true; }
+   bool sweepB = (!ICT_RequireSweep) ? true : DetectSweep(true);
+   bool sweepS = (!ICT_RequireSweep) ? true : DetectSweep(false);
+   double asHi=0.0, asLo=0.0; bool useRange=true;
+   if(ICT_UseSessionRange){ AsiaRange(asHi,asLo); if(asHi==-DBL_MAX || asLo==DBL_MAX) useRange=false; }
+   double z1B=0.0,z2B=0.0,z1S=0.0,z2S=0.0; bool okB=true, okS=true;
+   if(ICT_UseOTE){ okB=ComputeOTE(true,z1B,z2B); okS=ComputeOTE(false,z1S,z2S); }
+   bool fvgB = (!ICT_UseFVG) ? true : HasDirectionalFVG(true);
+   bool fvgS = (!ICT_UseFVG) ? true : HasDirectionalFVG(false);
+   double bid=SymbolInfoDouble(GSymbol,SYMBOL_BID);
+   bool condBuy = bull && sweepB && fvgB;
+   if(ICT_UseSessionRange && useRange) condBuy = condBuy && (bid>asLo);
+   if(ICT_UseOTE && okB)               condBuy = condBuy && (bid>=z1B && bid<=z2B);
+   bool condSell= bear && sweepS && fvgS;
+   if(ICT_UseSessionRange && useRange) condSell= condSell && (bid<asHi);
+   if(ICT_UseOTE && okS)               condSell= condSell && (bid>=z1S && bid<=z2S);
+   buy=condBuy; sell=condSell; return true;
+}
+
+bool GenerateSignals(bool &buy, bool &sell)
+{
+   if(SignalMode==ENTRY_Simple) return SimpleSignals(buy,sell);
+   return ICTSignals(buy,sell);
+}
+
+//------------------------------ Risk & Orders -----------------------//
+double iATRpips(const string sym, ENUM_TIMEFRAMES tf, int per)
+{
+   int h=iATR(sym,tf,per);
+   if(h==INVALID_HANDLE) return 0.0;
+   double v[1]; int n=CopyBuffer(h,0,0,1,v); IndicatorRelease(h);
+   if(n!=1) return 0.0; 
+   return PriceToPips(v[0]);
+}
+bool ComputeSLTP(bool isBuy, double &sl, double &tp)
+{
+   double atrp=(UseATRStops? iATRpips(GSymbol,PERIOD_M15,ATRPeriod) : 0.0);
+   double slp=(UseATRStops && atrp>0.0)? MathMax(atrp*ATR_SL_Mult,MinSL_Pips) : MathMax(MinSL_Pips,6.0);
+   double tpp=(UseATRStops && atrp>0.0)? atrp*ATR_TP_Mult : slp*2.0;
+   double pr=(isBuy? SymbolInfoDouble(GSymbol,SYMBOL_ASK) : SymbolInfoDouble(GSymbol,SYMBOL_BID));
+   double slpC=(isBuy? pr - PipsToPoints(slp)*_Point : pr + PipsToPoints(slp)*_Point);
+   double tppC=(isBuy? pr + PipsToPoints(tpp)*_Point : pr - PipsToPoints(tpp)*_Point);
+   int d=(int)SymbolInfoInteger(GSymbol,SYMBOL_DIGITS);
+   sl=NormalizeDouble(slpC,d); tp=NormalizeDouble(tppC,d); 
+   return true;
+}
+double CalcLotByRisk(double sl_price)
+{
+   if(UseFixedLot) return FixedLotSize;
+   double equity=AccountInfoDouble(ACCOUNT_EQUITY);
+   double ask=SymbolInfoDouble(GSymbol,SYMBOL_ASK);
+   double dist=MathAbs(PriceToPips(ask-sl_price)); if(dist<=0.0) dist=MinSL_Pips;
+   double tickVal=SymbolInfoDouble(GSymbol,SYMBOL_TRADE_TICK_VALUE);
+   double tickSz=SymbolInfoDouble(GSymbol,SYMBOL_TRADE_TICK_SIZE);
+   double pipValPerLot=(tickSz>0? tickVal/tickSz : 0.0)*PipValue();
+   double risk=equity*(MaxRiskPercent/100.0);
+   double lots=(pipValPerLot>0? risk/(dist*pipValPerLot) : 0.0);
+   double minlot=0.0,maxlot=0.0,step=0.0;
+   SymbolInfoDouble(GSymbol,SYMBOL_VOLUME_MIN,minlot);
+   SymbolInfoDouble(GSymbol,SYMBOL_VOLUME_MAX,maxlot);
+   SymbolInfoDouble(GSymbol,SYMBOL_VOLUME_STEP,step);
+   if(step>0) lots=MathFloor(lots/step)*step;
+   if(lots<minlot) lots=minlot;
+   if(lots>maxlot) lots=maxlot;
+   return lots;
+}
+
+//------------------------------ Position Counters -------------------//
+int CountPositionsSymbol(const string sym)
+{
+   int cnt   = 0;
+   int total = (int)PositionsTotal();
+   int i     = 0;
+   
+   while (i < total)
+   {
+      if (PositionSelectByIndex(i))
+      {
+         string psym = (string)PositionGetString(POSITION_SYMBOL);
+         int    mg   = (int)PositionGetInteger(POSITION_MAGIC);
+         if (psym == sym && mg == MagicNumber)
+            cnt = cnt + 1;
+      }
+      i = i + 1;
+   }
+   return cnt;
+}
+
+int CountPositionsAll()
+{
+   int cnt   = 0;
+   int total = (int)PositionsTotal();
+   int i     = 0;
+
+   while (i < total)
+   {
+      if (PositionSelectByIndex(i))
+      {
+         int mg = (int)PositionGetInteger(POSITION_MAGIC);
+         if (mg == MagicNumber)
+            cnt = cnt + 1;
+      }
+      i = i + 1;
+   }
+   return cnt;
+}
+
+//------------------------------ Trade Guards ------------------------//
+bool PreTradeGuards()
+{
+   if(!EnableEA) return false;
+   if(!InSession()) return false;
+   if(!InICTSessions()) return false;
+   if(InNewsPauseWindow()) return false;
+   if(SpreadPoints()>MaxSpreadPoints) return false;
+   if(CountPositionsSymbol(GSymbol)>=MaxPositionsPerSym) return false;
+   if(CountPositionsAll()>=MaxPositionsTotal) return false;
+   return true;
+}
+
+void TryOrder(const bool isBuy)
+{
+   double sl=0.0,tp=0.0;
+   if(!ComputeSLTP(isBuy,sl,tp)){ Info("SL/TP calc failed"); return; }
+   double lots=(UseFixedLot? FixedLotSize : CalcLotByRisk(sl));
+   double minlot=0.0,maxlot=0.0,step=0.0;
+   SymbolInfoDouble(GSymbol,SYMBOL_VOLUME_MIN,minlot);
+   SymbolInfoDouble(GSymbol,SYMBOL_VOLUME_MAX,maxlot);
+   SymbolInfoDouble(GSymbol,SYMBOL_VOLUME_STEP,step);
+   if(lots<minlot) lots=minlot;
+   if(lots>maxlot) lots=maxlot;
+   Trade.SetExpertMagicNumber(MagicNumber);
+   Trade.SetDeviationInPoints(SlippagePoints);
+   bool ok=false;
+   if(isBuy) ok=Trade.Buy(lots,GSymbol,0.0,sl,tp,"PRO-Buy");
+   else      ok=Trade.Sell(lots,GSymbol,0.0,sl,tp,"PRO-Sell");
+   if(ok){ GOrders++; Info("Order placed"); } else { Info("Order failed"); }
+}
+
+void TryPartialClose(const string sym, const double pips, const double trig, const double pct){
+   if(!EnablePartialClose) return;
+   if(pips<trig) return;
+   if(!PositionSelect(sym)) return;
+   double vol=PositionGetDouble(POSITION_VOLUME);
+   double minlot=0.0,maxlot=0.0,step=0.0;
+   SymbolInfoDouble(sym,SYMBOL_VOLUME_MIN,minlot);
+   SymbolInfoDouble(sym,SYMBOL_VOLUME_MAX,maxlot);
+   SymbolInfoDouble(sym,SYMBOL_VOLUME_STEP,step);
+   double closeVol=vol*(pct/100.0);
+   if(step>0) closeVol=MathFloor(closeVol/step)*step;
+   if(closeVol>=minlot && closeVol<vol){
+      Trade.PositionClosePartial(sym,closeVol);
+      Info("Partial close executed");
+   }
+}
+
+//------------------------------ Position Management -----------------//
+void ManageOpenPositions()
+{
+   int total = (int)PositionsTotal();
+   int p     = total - 1;
+
+   while (p >= 0)
+   {
+      if (PositionSelectByIndex(p))
+      {
+         if ((int)PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+         {
+            string sym = (string)PositionGetString(POSITION_SYMBOL);
+            long   typ = (long)PositionGetInteger(POSITION_TYPE);
+            double ep  = PositionGetDouble(POSITION_PRICE_OPEN);
+            double sl  = PositionGetDouble(POSITION_SL);
+            double tp  = PositionGetDouble(POSITION_TP);
+
+            double pr  = (typ==POSITION_TYPE_BUY ? SymbolInfoDouble(sym,SYMBOL_BID)
+                                                 : SymbolInfoDouble(sym,SYMBOL_ASK));
+            double pips = (typ==POSITION_TYPE_BUY ? PriceToPips(pr-ep) : PriceToPips(ep-pr));
+
+            // Break-even
+            if (EnableBreakEven && pips >= BreakEvenTriggerPips)
+            {
+               double be = (typ==POSITION_TYPE_BUY
+                            ? ep + PipsToPoints(BreakEvenOffsetPips)*_Point
+                            : ep - PipsToPoints(BreakEvenOffsetPips)*_Point);
+               int d = (int)SymbolInfoInteger(sym,SYMBOL_DIGITS);
+               be = NormalizeDouble(be,d);
+               bool need = (typ==POSITION_TYPE_BUY ? (sl==0.0 || be>sl) : (sl==0.0 || be<sl));
+               if (need) Trade.PositionModify(sym,be,tp);
+            }
+
+            // Trailing - Fixed
+            if (DefaultTrailing==TRAIL_Fixed && pips >= TrailingStartPips)
+            {
+               double newSL = (typ==POSITION_TYPE_BUY
+                               ? pr - PipsToPoints(TrailingDistancePips)*_Point
+                               : pr + PipsToPoints(TrailingDistancePips)*_Point);
+               int d2 = (int)SymbolInfoInteger(sym,SYMBOL_DIGITS);
+               newSL = NormalizeDouble(newSL,d2);
+               bool need2 = (typ==POSITION_TYPE_BUY ? (sl==0.0 || newSL>sl) : (sl==0.0 || newSL<sl));
+               if (need2) Trade.PositionModify(sym,newSL,tp);
+            }
+            // Trailing - ATR
+            else if (DefaultTrailing==TRAIL_ATR)
+            {
+               double atrp = iATRpips(sym,PERIOD_M15,ATRPeriod);
+               if (atrp > 0.0 && pips >= atrp*ATR_Trail_Mult)
+               {
+                  double newSL2 = (typ==POSITION_TYPE_BUY
+                                   ? pr - PipsToPoints(atrp*ATR_Trail_Mult)*_Point
+                                   : pr + PipsToPoints(atrp*ATR_Trail_Mult)*_Point);
+                  int d3 = (int)SymbolInfoInteger(sym,SYMBOL_DIGITS);
+                  newSL2 = NormalizeDouble(newSL2,d3);
+                  bool need3 = (typ==POSITION_TYPE_BUY ? (sl==0.0 || newSL2>sl) : (sl==0.0 || newSL2<sl));
+                  if (need3) Trade.PositionModify(sym,newSL2,tp);
+               }
+            }
+
+            // Partial close
+            TryPartialClose(sym,pips,PC1_TriggerPips,PC1_ClosePct);
+            TryPartialClose(sym,pips,PC2_TriggerPips,PC2_ClosePct);
+            TryPartialClose(sym,pips,PC3_TriggerPips,PC3_ClosePct);
+         }
+      }
+      p = p - 1;
+   }
+}
+
+//------------------------------ Daily Stop --------------------------//
+void CheckDailyStop()
+{
+   double dd = AccountDailyPnLPercent();
+   if (MaxDailyLossPercent > 0.0 && dd <= -fabs(MaxDailyLossPercent))
+   {
+      int p = (int)PositionsTotal() - 1;
+      while (p >= 0)
+      {
+         if (PositionSelectByIndex(p))
+         {
+            if ((int)PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+            {
+               string sym = (string)PositionGetString(POSITION_SYMBOL);
+               Trade.PositionClose(sym);
+            }
+         }
+         p = p - 1;
+      }
+      FlushStats();
+      ExpertRemove();
+   }
+}
+//------------------------------ Panel -------------------------------//
+void DrawPanel()
+{
+   datetime now=TimeCurrent();
+   if(now==GLastPanel) return;
+   GLastPanel=now;
+   string sess=(UseICTSessions? "ICT" : (UseSessionFilter? "Sess":"All"));
+   string txt=StringFormat("Hybrid_Shot_Pro v5.0 | Spread:%d | Daily:%.2f%% | Sess:%s | Orders:%d W:%d L:%d MaxDD:%.2f%%",
+      SpreadPoints(), AccountDailyPnLPercent(), sess, (int)GOrders, (int)GWins, (int)GLosses, GMaxDD);
+   Comment(txt);
+}
+
+//------------------------------ Lifecycle ---------------------------//
+int OnInit()
+{
+   if(!CheckLicense()) return INIT_FAILED;
+   GSymbol=_Symbol;
+   GDigits=(int)SymbolInfoInteger(GSymbol,SYMBOL_DIGITS);
+   GPoint =_Point;
+   GPip   =PipValue();
+   MqlDateTime dt; TimeToStruct(TimeCurrent(),dt); dt.hour=0; dt.min=0; dt.sec=0; GDayStart=StructToTime(dt);
+   GEquityAtDayStart=AccountInfoDouble(ACCOUNT_EQUITY);
+   Trade.SetExpertMagicNumber(MagicNumber);
+   Trade.SetDeviationInPoints(SlippagePoints);
+   return INIT_SUCCEEDED;
+}
+void OnDeinit(const int reason){
+   FlushStats();
+   Comment("");
+}
+void OnTick()
+{
+   if(TimeCurrent()-GDayStart>=86400)
+   {
+      MqlDateTime dt; TimeToStruct(TimeCurrent(),dt); dt.hour=0; dt.min=0; dt.sec=0; GDayStart=StructToTime(dt);
+      GEquityAtDayStart=AccountInfoDouble(ACCOUNT_EQUITY);
+   }
+   UpdateDrawdownStat();
+   CheckDailyStop();
+   ManageOpenPositions();
+   if(PreTradeGuards())
+   {
+      bool b=false,s=false;
+      if(GenerateSignals(b,s))
+      {
+         if(TradeDirection==DIR_BuyOnly) s=false;
+         if(TradeDirection==DIR_SellOnly) b=false;
+         if(b && !s) TryOrder(true);
+         if(s && !b) TryOrder(false);
+      }
+   }
+   DrawPanel();
+}
+void OnTradeTransaction(const MqlTradeTransaction& trans, const MqlTradeRequest& req, const MqlTradeResult& res){
+   if(trans.type==TRADE_TRANSACTION_DEAL_ADD)
+   {
+      if(HistoryDealSelect(trans.deal))
+      {
+         long magic =HistoryDealGetInteger(trans.deal,DEAL_MAGIC);
+         string sym =HistoryDealGetString (trans.deal,DEAL_SYMBOL);
+         long entry =HistoryDealGetInteger(trans.deal,DEAL_ENTRY);
+         double profit=HistoryDealGetDouble (trans.deal,DEAL_PROFIT);
+         if(magic==MagicNumber && sym==GSymbol && entry==DEAL_ENTRY_OUT)
+         {
+            GGrossPnL+=profit;
+            if(profit>=0.0) GWins++; else GLosses++;
+         }
+      }
+   }
+}
+//+------------------------------------------------------------------+
