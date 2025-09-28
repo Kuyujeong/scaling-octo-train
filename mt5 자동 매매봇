@@ -454,11 +454,15 @@ bool ComputeSLTP(bool isBuy, double &sl, double &tp)
    return true;
 }
 double CalcLotByRisk(double sl_price)
+double CalcLotByRisk(const bool isBuy, const double sl_price)
 {
    if(UseFixedLot) return FixedLotSize;
    double equity=AccountInfoDouble(ACCOUNT_EQUITY);
    double ask=SymbolInfoDouble(GSymbol,SYMBOL_ASK);
    double dist=MathAbs(PriceToPips(ask-sl_price)); if(dist<=0.0) dist=MinSL_Pips;
+   double entry=(isBuy? SymbolInfoDouble(GSymbol,SYMBOL_ASK) : SymbolInfoDouble(GSymbol,SYMBOL_BID));
+   double dist=MathAbs(PriceToPips(entry-sl_price));
+   if(dist<=0.0) dist=MinSL_Pips;
    double tickVal=SymbolInfoDouble(GSymbol,SYMBOL_TRADE_TICK_VALUE);
    double tickSz=SymbolInfoDouble(GSymbol,SYMBOL_TRADE_TICK_SIZE);
    double pipValPerLot=(tickSz>0? tickVal/tickSz : 0.0)*PipValue();
@@ -484,28 +488,7 @@ int CountPositionsSymbol(const string sym)
    while (i < total)
    {
       if (PositionSelectByIndex(i))
-      {
-         string psym = (string)PositionGetString(POSITION_SYMBOL);
-         int    mg   = (int)PositionGetInteger(POSITION_MAGIC);
-         if (psym == sym && mg == MagicNumber)
-            cnt = cnt + 1;
-      }
-      i = i + 1;
-   }
-   return cnt;
-}
-
-int CountPositionsAll()
-{
-   int cnt   = 0;
-   int total = (int)PositionsTotal();
-   int i     = 0;
-
-   while (i < total)
-   {
-      if (PositionSelectByIndex(i))
-      {
-         int mg = (int)PositionGetInteger(POSITION_MAGIC);
+@@ -509,51 +510,51 @@ int CountPositionsAll()
          if (mg == MagicNumber)
             cnt = cnt + 1;
       }
@@ -532,6 +515,7 @@ void TryOrder(const bool isBuy)
    double sl=0.0,tp=0.0;
    if(!ComputeSLTP(isBuy,sl,tp)){ Info("SL/TP calc failed"); return; }
    double lots=(UseFixedLot? FixedLotSize : CalcLotByRisk(sl));
+   double lots=(UseFixedLot? FixedLotSize : CalcLotByRisk(isBuy,sl));
    double minlot=0.0,maxlot=0.0,step=0.0;
    SymbolInfoDouble(GSymbol,SYMBOL_VOLUME_MIN,minlot);
    SymbolInfoDouble(GSymbol,SYMBOL_VOLUME_MAX,maxlot);
@@ -557,6 +541,7 @@ void TryPartialClose(const string sym, const double pips, const double trig, con
    SymbolInfoDouble(sym,SYMBOL_VOLUME_STEP,step);
    double closeVol=vol*(pct/100.0);
    if(step>0) closeVol=MathFloor(closeVol/step)*step;
+
    if(closeVol>=minlot && closeVol<vol){
       Trade.PositionClosePartial(sym,closeVol);
       Info("Partial close executed");
